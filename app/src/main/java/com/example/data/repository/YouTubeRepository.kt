@@ -1,0 +1,372 @@
+package com.example.data.repository
+
+import android.util.Log
+import com.example.BuildConfig
+import com.example.data.local.AppDatabase
+import com.example.data.local.PhraseHistoryEntity
+import com.example.data.local.PrepopulatedYouTubeStudy
+import com.example.data.local.UserMistakeEntity
+import com.example.data.local.UserStatsEntity
+import com.example.data.local.VocabularyEntity
+import com.example.data.model.CefrLevel
+import com.example.data.model.YouTubeCategory
+import com.example.data.model.YouTubeSearchFilter
+import com.example.data.model.YouTubeStudyPhrase
+import com.example.data.model.YouTubeVideoItem
+import com.example.data.remote.YouTubeApiService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.regex.Pattern
+
+sealed class YouTubeSearchResult {
+    data class Success(val videos: List<YouTubeVideoItem>, val isLiveApi: Boolean, val notice: String? = null) : YouTubeSearchResult()
+    data class Error(val message: String, val isQuotaExceeded: Boolean = false, val fallbackVideos: List<YouTubeVideoItem> = emptyList()) : YouTubeSearchResult()
+}
+
+class YouTubeRepository(
+    private val db: AppDatabase,
+    private val apiService: YouTubeApiService = YouTubeApiService.create()
+) {
+
+    private val apiKey: String
+        get() {
+            return try {
+                // Injected via Secrets Gradle Plugin from .env / Secrets panel
+                BuildConfig.YOUTUBE_API_KEY
+            } catch (e: Exception) {
+                ""
+            }
+        }
+
+    suspend fun searchYouTubeVideos(filter: YouTubeSearchFilter): YouTubeSearchResult = withContext(Dispatchers.IO) {
+        val currentKey = apiKey.trim()
+        val isPlaceholder = currentKey.isEmpty() || currentKey == "MY_YOUTUBE_API_KEY"
+
+        if (isPlaceholder) {
+            Log.w("YouTubeRepository", "YouTube API Key is missing or placeholder. Using curated library.")
+            val filteredCurated = filterCuratedVideos(filter)
+            return@withContext YouTubeSearchResult.Success(
+                videos = filteredCurated,
+                isLiveApi = false,
+                notice = "Chave da YouTube API não configurada no Secrets. Exibindo acervo educacional verificado."
+            )
+        }
+
+        try {
+            // Build query including category search keywords and optional level terms
+            val levelQuery = filter.level?.let { "English ${it.code}" } ?: "English conversation"
+            val baseQuery = filter.query.trim().ifEmpty { filter.category.searchKeywords }
+            val fullSearchQuery = "$baseQuery $levelQuery dialogue subtitle"
+
+            val licenseParam = if (filter.creativeCommonsOnly) "creativeCommon" else null
+
+            val response = apiService.searchVideos(
+                part = "snippet",
+                type = "video",
+                videoEmbeddable = "true",
+                videoCaption = "closedCaption",
+                relevanceLanguage = "en",
+                safeSearch = "strict",
+                videoLicense = licenseParam,
+                query = fullSearchQuery,
+                maxResults = 12,
+                apiKey = currentKey
+            )
+
+            if (!response.isSuccessful) {
+                val errorCode = response.code()
+                val errorBody = response.errorBody()?.string() ?: ""
+                val isQuota = errorCode == 403 && (errorBody.contains("quotaExceeded", ignoreCase = true) || errorBody.contains("rateLimitExceeded", ignoreCase = true))
+
+                Log.e("YouTubeRepository", "YouTube API Error: $errorCode $errorBody")
+
+                val errorMessage = if (isQuota) {
+                    "Limite de cota da YouTube API atingido para hoje. Mostrando vídeos educacionais recomendados."
+                } else {
+                    "Erro ao consultar YouTube API ($errorCode). Mostrando vídeos recomendados."
+                }
+
+                return@withContext YouTubeSearchResult.Error(
+                    message = errorMessage,
+                    isQuotaExceeded = isQuota,
+                    fallbackVideos = filterCuratedVideos(filter)
+                )
+            }
+
+            val searchBody = response.body()
+            val items = searchBody?.items.orEmpty()
+            val videoIds = items.mapNotNull { it.id?.videoId }.filter { it.isNotBlank() }
+
+            if (videoIds.isEmpty()) {
+                val fallback = filterCuratedVideos(filter)
+                return@withContext if (fallback.isNotEmpty()) {
+                    YouTubeSearchResult.Success(
+                        videos = fallback,
+                        isLiveApi = true,
+                        notice = "Nenhum resultado direto da busca; exibindo recomendações da categoria."
+                    )
+                } else {
+                    YouTubeSearchResult.Error(
+                        message = "Não encontramos vídeos para essa pesquisa.",
+                        fallbackVideos = emptyList()
+                    )
+                }
+            }
+
+            // Fetch video details (duration, embeddable status, license)
+            val detailsMap = try {
+                val detailsResponse = apiService.getVideoDetails(
+                    part = "snippet,contentDetails,status",
+                    videoIds = videoIds.joinToString(","),
+                    apiKey = currentKey
+                )
+                if (detailsResponse.isSuccessful) {
+                    detailsResponse.body()?.items?.associateBy { it.id.orEmpty() }.orEmpty()
+                } else {
+                    emptyMap()
+                }
+            } catch (e: Exception) {
+                emptyMap()
+            }
+
+            val resultVideos = items.mapNotNull { item ->
+                val videoId = item.id?.videoId ?: return@mapNotNull null
+                val snippet = item.snippet ?: return@mapNotNull null
+                val details = detailsMap[videoId]
+
+                val isEmbeddable = details?.status?.embeddable ?: true
+                if (!isEmbeddable) return@mapNotNull null // Strict: only embeddable videos
+
+                val license = details?.status?.license ?: if (filter.creativeCommonsOnly) "creativeCommon" else "youtube"
+                val rawDuration = details?.contentDetails?.duration
+                val parsedDuration = parseIsoDuration(rawDuration)
+
+                val suggestedLevel = filter.level ?: estimateCefrLevel(snippet.title.orEmpty(), snippet.description.orEmpty())
+
+                // Check if we have an authorized study set in the curated library
+                val authorizedSet = PrepopulatedYouTubeStudy.getStudySetForVideo(videoId)
+
+                YouTubeVideoItem(
+                    id = videoId,
+                    title = cleanHtmlEntities(snippet.title.orEmpty()),
+                    channelTitle = cleanHtmlEntities(snippet.channelTitle.orEmpty()),
+                    description = cleanHtmlEntities(snippet.description.orEmpty()),
+                    thumbnailUrl = snippet.thumbnails?.high?.url
+                        ?: snippet.thumbnails?.medium?.url
+                        ?: snippet.thumbnails?.default?.url
+                        ?: "https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?w=600",
+                    durationFormatted = parsedDuration.first,
+                    durationSeconds = parsedDuration.second,
+                    suggestedLevel = suggestedLevel,
+                    hasClosedCaptions = true,
+                    isEmbeddable = true,
+                    license = license,
+                    publishedAt = snippet.publishedAt.orEmpty().take(10),
+                    category = filter.category,
+                    authorizedStudySet = authorizedSet
+                )
+            }
+
+            if (resultVideos.isEmpty()) {
+                return@withContext YouTubeSearchResult.Error(
+                    message = "Não encontramos vídeos incorporáveis com legendas para essa pesquisa.",
+                    fallbackVideos = filterCuratedVideos(filter)
+                )
+            }
+
+            YouTubeSearchResult.Success(
+                videos = resultVideos,
+                isLiveApi = true
+            )
+
+        } catch (e: Exception) {
+            Log.e("YouTubeRepository", "Search exception", e)
+            YouTubeSearchResult.Error(
+                message = "Sem conexão ou erro de rede ao buscar vídeos: ${e.localizedMessage}",
+                fallbackVideos = filterCuratedVideos(filter)
+            )
+        }
+    }
+
+    private fun filterCuratedVideos(filter: YouTubeSearchFilter): List<YouTubeVideoItem> {
+        return PrepopulatedYouTubeStudy.curatedVideos.filter { video ->
+            val matchQuery = filter.query.isBlank() ||
+                    video.title.contains(filter.query, ignoreCase = true) ||
+                    video.description.contains(filter.query, ignoreCase = true)
+            val matchLevel = filter.level == null || video.suggestedLevel == filter.level
+            val matchCC = !filter.creativeCommonsOnly || video.isCreativeCommons
+            val matchCat = video.category == filter.category || filter.category == YouTubeCategory.CONVERSATION
+            matchQuery && matchLevel && matchCC && (matchCat || filter.query.isNotBlank())
+        }.ifEmpty { PrepopulatedYouTubeStudy.curatedVideos }
+    }
+
+    suspend fun getVideoById(videoId: String): YouTubeVideoItem? = withContext(Dispatchers.IO) {
+        val curated = PrepopulatedYouTubeStudy.curatedVideos.firstOrNull { it.id == videoId }
+        if (curated != null) return@withContext curated
+
+        // If not in curated, attempt live API details
+        val currentKey = apiKey.trim()
+        if (currentKey.isNotEmpty() && currentKey != "MY_YOUTUBE_API_KEY") {
+            try {
+                val response = apiService.getVideoDetails(
+                    part = "snippet,contentDetails,status",
+                    videoIds = videoId,
+                    apiKey = currentKey
+                )
+                if (response.isSuccessful) {
+                    val item = response.body()?.items?.firstOrNull()
+                    if (item != null && item.snippet != null) {
+                        val parsedDuration = parseIsoDuration(item.contentDetails?.duration)
+                        return@withContext YouTubeVideoItem(
+                            id = videoId,
+                            title = cleanHtmlEntities(item.snippet.title.orEmpty()),
+                            channelTitle = cleanHtmlEntities(item.snippet.channelTitle.orEmpty()),
+                            description = cleanHtmlEntities(item.snippet.description.orEmpty()),
+                            thumbnailUrl = item.snippet.thumbnails?.high?.url
+                                ?: item.snippet.thumbnails?.medium?.url
+                                ?: item.snippet.thumbnails?.default?.url
+                                ?: "",
+                            durationFormatted = parsedDuration.first,
+                            durationSeconds = parsedDuration.second,
+                            suggestedLevel = estimateCefrLevel(item.snippet.title.orEmpty(), item.snippet.description.orEmpty()),
+                            hasClosedCaptions = true,
+                            isEmbeddable = item.status?.embeddable ?: true,
+                            license = item.status?.license ?: "youtube",
+                            publishedAt = item.snippet.publishedAt.orEmpty().take(10),
+                            authorizedStudySet = PrepopulatedYouTubeStudy.getStudySetForVideo(videoId)
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("YouTubeRepository", "Failed to fetch video details for $videoId", e)
+            }
+        }
+
+        null
+    }
+
+    suspend fun recordYouTubeStudyResult(
+        videoId: String,
+        phrase: YouTubeStudyPhrase,
+        wasContractionCorrect: Boolean,
+        wasTranslationCorrect: Boolean,
+        wasComprehensionCorrect: Boolean
+    ) = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val allCorrect = wasContractionCorrect && wasTranslationCorrect && wasComprehensionCorrect
+
+        // 1. Update User Stats
+        val stats = db.userStatsDao().getUserStatsDirect() ?: UserStatsEntity()
+        val updatedStats = stats.copy(
+            totalPhrasesStudied = stats.totalPhrasesStudied + 1,
+            totalCorrect = stats.totalCorrect + (if (allCorrect) 1 else 0),
+            totalErrors = stats.totalErrors + (if (!allCorrect) 1 else 0),
+            lastStudyDateMillis = now
+        )
+        db.userStatsDao().saveUserStats(updatedStats)
+
+        // 2. Record Mistakes if any
+        phrase.contractionsList.forEach { contraction ->
+            val tag = "${contraction.fullForm} -> ${contraction.contractedForm}"
+            val existing = db.userMistakeDao().getMistakeByTag(tag)
+            if (!wasContractionCorrect) {
+                if (existing != null) {
+                    db.userMistakeDao().incrementMistake(tag, now)
+                } else {
+                    db.userMistakeDao().insertOrUpdateMistake(
+                        UserMistakeEntity(
+                            structureTag = tag,
+                            fullForm = contraction.fullForm,
+                            contractedForm = contraction.contractedForm,
+                            category = "YouTube Spoken English",
+                            errorCount = 1,
+                            successCount = 0,
+                            lastMistakeMillis = now,
+                            sampleSentence = phrase.contractedForm,
+                            sampleTranslation = phrase.portugueseTranslation,
+                            pedagogicalTip = contraction.ruleExplanation
+                        )
+                    )
+                }
+            } else {
+                if (existing != null) {
+                    db.userMistakeDao().incrementSuccess(tag)
+                }
+            }
+        }
+
+        // 3. Record vocabulary acquired
+        val vocabEntities = phrase.vocabularyNotes.map { item ->
+            VocabularyEntity(
+                term = item.word,
+                meaning = item.meaning,
+                exampleSentence = item.example,
+                exampleTranslation = item.translation,
+                cefrLevel = item.level.code,
+                itemType = if (item.isInformal) "INFORMAL_SPOKEN" else "VOCABULARY",
+                isMastered = allCorrect,
+                timestamp = now
+            )
+        }
+        if (vocabEntities.isNotEmpty()) {
+            db.vocabularyDao().insertAll(vocabEntities)
+        }
+
+        // 4. Record phrase history
+        db.phraseHistoryDao().insertHistory(
+            PhraseHistoryEntity(
+                sceneId = "youtube_$videoId",
+                phraseId = phrase.id,
+                fullSentence = phrase.fullForm,
+                naturalSentence = phrase.contractedForm,
+                userTranslation = phrase.portugueseTranslation,
+                wasCorrect = allCorrect,
+                timestamp = now
+            )
+        )
+    }
+
+    private fun estimateCefrLevel(title: String, description: String): CefrLevel {
+        val combined = "$title $description".lowercase()
+        return when {
+            combined.contains("c1") || combined.contains("c2") || combined.contains("advanced") || combined.contains("fluent") -> CefrLevel.C1
+            combined.contains("b2") || combined.contains("upper intermediate") || combined.contains("business") -> CefrLevel.B2
+            combined.contains("b1") || combined.contains("intermediate") -> CefrLevel.B1
+            combined.contains("a1") || combined.contains("beginner") || combined.contains("starter") || combined.contains("basic") -> CefrLevel.A1
+            else -> CefrLevel.A2
+        }
+    }
+
+    private fun parseIsoDuration(isoDuration: String?): Pair<String, Int> {
+        if (isoDuration.isNullOrBlank()) return Pair("3:00", 180)
+        try {
+            val pattern = Pattern.compile("PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?")
+            val matcher = pattern.matcher(isoDuration)
+            if (matcher.matches()) {
+                val hours = matcher.group(1)?.toIntOrNull() ?: 0
+                val minutes = matcher.group(2)?.toIntOrNull() ?: 0
+                val seconds = matcher.group(3)?.toIntOrNull() ?: 0
+
+                val totalSeconds = hours * 3600 + minutes * 60 + seconds
+                val formatted = if (hours > 0) {
+                    String.format("%d:%02d:%02d", hours, minutes, seconds)
+                } else {
+                    String.format("%d:%02d", minutes, seconds)
+                }
+                return Pair(formatted, totalSeconds)
+            }
+        } catch (e: Exception) {
+            // fallback
+        }
+        return Pair("3:30", 210)
+    }
+
+    private fun cleanHtmlEntities(text: String): String {
+        return text
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+    }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "Scene English",
+  "description": "Aprenda inglês falado e natural com cenas de diálogos, contrações reais, tradução semântica inteligente e explicações guiadas por IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
