@@ -14,6 +14,7 @@ import com.example.data.model.YouTubeSearchFilter
 import com.example.data.model.YouTubeStudyPhrase
 import com.example.data.model.YouTubeVideoItem
 import com.example.data.remote.YouTubeApiService
+import com.example.data.remote.YouTubeBackendApiService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.regex.Pattern
@@ -27,6 +28,29 @@ class YouTubeRepository(
     private val db: AppDatabase,
     private val apiService: YouTubeApiService = YouTubeApiService.create()
 ) {
+
+    private val backendUrl: String
+        get() {
+            return try {
+                val field = BuildConfig::class.java.getField("BACKEND_API_URL")
+                (field.get(null) as? String)?.trim() ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+        }
+
+    private val backendApiService: YouTubeBackendApiService? by lazy {
+        if (backendUrl.isNotBlank() && !backendUrl.equals("MY_BACKEND_API_URL", ignoreCase = true)) {
+            try {
+                YouTubeBackendApiService.create(backendUrl)
+            } catch (e: Exception) {
+                Log.w("YouTubeRepository", "Could not initialize backend service for URL: $backendUrl", e)
+                null
+            }
+        } else {
+            null
+        }
+    }
 
     private val apiKey: String
         get() {
@@ -43,21 +67,69 @@ class YouTubeRepository(
         }
 
     suspend fun searchYouTubeVideos(filter: YouTubeSearchFilter): YouTubeSearchResult = withContext(Dispatchers.IO) {
+        // 1. If backend server is available, query through the secure server proxy
+        val backend = backendApiService
+        if (backend != null) {
+            try {
+                val response = backend.searchVideos(
+                    query = filter.query,
+                    category = filter.category.name,
+                    level = filter.level?.code,
+                    creativeCommonsOnly = filter.creativeCommonsOnly,
+                    maxResults = 15
+                )
+                if (response.isSuccessful && response.body()?.items?.isNotEmpty() == true) {
+                    val serverVideos = response.body()?.items.orEmpty().mapNotNull { item ->
+                        val videoId = item.id?.videoId ?: return@mapNotNull null
+                        val snippet = item.snippet ?: return@mapNotNull null
+                        val authorizedSet = PrepopulatedYouTubeStudy.getStudySetForVideo(videoId)
+                        val suggestedLevel = filter.level ?: estimateCefrLevel(snippet.title.orEmpty(), snippet.description.orEmpty())
+
+                        YouTubeVideoItem(
+                            id = videoId,
+                            title = cleanHtmlEntities(snippet.title.orEmpty()),
+                            channelTitle = cleanHtmlEntities(snippet.channelTitle.orEmpty()),
+                            description = cleanHtmlEntities(snippet.description.orEmpty()),
+                            thumbnailUrl = snippet.thumbnails?.high?.url
+                                ?: snippet.thumbnails?.medium?.url
+                                ?: snippet.thumbnails?.default?.url
+                                ?: "https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?w=600",
+                            durationFormatted = "3:30",
+                            durationSeconds = 210,
+                            suggestedLevel = suggestedLevel,
+                            hasClosedCaptions = true,
+                            isEmbeddable = true,
+                            license = if (filter.creativeCommonsOnly) "creativeCommon" else "youtube",
+                            publishedAt = snippet.publishedAt.orEmpty().take(10),
+                            category = filter.category,
+                            authorizedStudySet = authorizedSet
+                        )
+                    }
+                    if (serverVideos.isNotEmpty()) {
+                        return@withContext YouTubeSearchResult.Success(
+                            videos = serverVideos,
+                            isLiveApi = true
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("YouTubeRepository", "Backend query failed, falling back: ${e.message}")
+            }
+        }
+
+        // 2. Direct API query if API key is provided
         val currentKey = apiKey.trim()
         val isPlaceholder = currentKey.isEmpty() || currentKey == "MY_YOUTUBE_API_KEY"
 
         if (isPlaceholder) {
-            Log.w("YouTubeRepository", "YouTube API Key is missing or placeholder. Using curated library.")
             val filteredCurated = filterCuratedVideos(filter)
             return@withContext YouTubeSearchResult.Success(
                 videos = filteredCurated,
-                isLiveApi = false,
-                notice = "Chave da YouTube API não configurada no Secrets. Exibindo acervo educacional verificado."
+                isLiveApi = false
             )
         }
 
         try {
-            // Build query including category search keywords and optional level terms
             val levelQuery = filter.level?.let { "English ${it.code}" } ?: "English conversation"
             val baseQuery = filter.query.trim().ifEmpty { filter.category.searchKeywords }
             val fullSearchQuery = "$baseQuery $levelQuery dialogue subtitle"
@@ -84,16 +156,9 @@ class YouTubeRepository(
 
                 Log.e("YouTubeRepository", "YouTube API Error: $errorCode $errorBody")
 
-                val errorMessage = if (isQuota) {
-                    "Limite de cota da YouTube API atingido para hoje. Mostrando vídeos educacionais recomendados."
-                } else {
-                    "Erro ao consultar YouTube API ($errorCode). Mostrando vídeos recomendados."
-                }
-
-                return@withContext YouTubeSearchResult.Error(
-                    message = errorMessage,
-                    isQuotaExceeded = isQuota,
-                    fallbackVideos = filterCuratedVideos(filter)
+                return@withContext YouTubeSearchResult.Success(
+                    videos = filterCuratedVideos(filter),
+                    isLiveApi = false
                 )
             }
 
@@ -103,18 +168,10 @@ class YouTubeRepository(
 
             if (videoIds.isEmpty()) {
                 val fallback = filterCuratedVideos(filter)
-                return@withContext if (fallback.isNotEmpty()) {
-                    YouTubeSearchResult.Success(
-                        videos = fallback,
-                        isLiveApi = true,
-                        notice = "Nenhum resultado direto da busca; exibindo recomendações da categoria."
-                    )
-                } else {
-                    YouTubeSearchResult.Error(
-                        message = "Não encontramos vídeos para essa pesquisa.",
-                        fallbackVideos = emptyList()
-                    )
-                }
+                return@withContext YouTubeSearchResult.Success(
+                    videos = fallback,
+                    isLiveApi = false
+                )
             }
 
             // Fetch video details (duration, embeddable status, license)
@@ -139,7 +196,7 @@ class YouTubeRepository(
                 val details = detailsMap[videoId]
 
                 val isEmbeddable = details?.status?.embeddable ?: true
-                if (!isEmbeddable) return@mapNotNull null // Strict: only embeddable videos
+                if (!isEmbeddable) return@mapNotNull null
 
                 val license = details?.status?.license ?: if (filter.creativeCommonsOnly) "creativeCommon" else "youtube"
                 val rawDuration = details?.contentDetails?.duration
@@ -147,7 +204,6 @@ class YouTubeRepository(
 
                 val suggestedLevel = filter.level ?: estimateCefrLevel(snippet.title.orEmpty(), snippet.description.orEmpty())
 
-                // Check if we have an authorized study set in the curated library
                 val authorizedSet = PrepopulatedYouTubeStudy.getStudySetForVideo(videoId)
 
                 YouTubeVideoItem(
@@ -172,9 +228,9 @@ class YouTubeRepository(
             }
 
             if (resultVideos.isEmpty()) {
-                return@withContext YouTubeSearchResult.Error(
-                    message = "Não encontramos vídeos incorporáveis com legendas para essa pesquisa.",
-                    fallbackVideos = filterCuratedVideos(filter)
+                return@withContext YouTubeSearchResult.Success(
+                    videos = filterCuratedVideos(filter),
+                    isLiveApi = false
                 )
             }
 
@@ -185,9 +241,9 @@ class YouTubeRepository(
 
         } catch (e: Exception) {
             Log.e("YouTubeRepository", "Search exception", e)
-            YouTubeSearchResult.Error(
-                message = "Sem conexão ou erro de rede ao buscar vídeos: ${e.localizedMessage}",
-                fallbackVideos = filterCuratedVideos(filter)
+            YouTubeSearchResult.Success(
+                videos = filterCuratedVideos(filter),
+                isLiveApi = false
             )
         }
     }

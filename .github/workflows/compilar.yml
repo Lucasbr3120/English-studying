@@ -31,6 +31,17 @@ jobs:
         # Força a criação do arquivo gradlew que está faltando na raiz
         gradle wrapper --gradle-version 9.3.1
 
+    - name: Configurar Variáveis de Ambiente e Secrets
+      env:
+        YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        BACKEND_API_URL: ${{ secrets.BACKEND_API_URL }}
+      run: |
+        touch .env
+        [ -n "$YOUTUBE_API_KEY" ] && echo "YOUTUBE_API_KEY=${YOUTUBE_API_KEY}" >> .env || true
+        [ -n "$GEMINI_API_KEY" ] && echo "GEMINI_API_KEY=${GEMINI_API_KEY}" >> .env || true
+        [ -n "$BACKEND_API_URL" ] && echo "BACKEND_API_URL=${BACKEND_API_URL}" >> .env || true
+
     - name: Compilar APK Final
       run: |
         chmod +x gradlew
