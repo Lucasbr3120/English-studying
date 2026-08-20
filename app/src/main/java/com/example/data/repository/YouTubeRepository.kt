@@ -31,10 +31,14 @@ class YouTubeRepository(
     private val apiKey: String
         get() {
             return try {
-                // Injected via Secrets Gradle Plugin from .env / Secrets panel
-                BuildConfig.YOUTUBE_API_KEY
+                val buildKey = BuildConfig.YOUTUBE_API_KEY
+                if (buildKey.isNotBlank() && buildKey != "MY_YOUTUBE_API_KEY") {
+                    buildKey
+                } else {
+                    System.getenv("YOUTUBE_API_KEY") ?: buildKey
+                }
             } catch (e: Exception) {
-                ""
+                System.getenv("YOUTUBE_API_KEY") ?: ""
             }
         }
 
